@@ -26,8 +26,14 @@ START_DATE = "2026-01-19"
 END_DATE = "2026-01-21"
 
 LOCATIONS = [
-    {"id": 3023432, "name": "NASA GSFC Rutgers Calib. N7", "lat": 1.2976, "lon": 103.7803},
-    {"id": 3038744, "name": "Ocean Park", "lat": 1.3094745, "lon": 103.9178515},
+    {"id": 6273498, "name": "461B AQ",                     "lat": 1.3555,   "lon": 103.74033},
+    {"id": 3040714, "name": "Midwood",                     "lat": 1.36411,  "lon": 103.76370},
+    {"id": 3023432, "name": "NASA GSFC Rutgers Calib. N7", "lat": 1.29761,  "lon": 103.78031},
+    {"id": 5905179, "name": "Shelford",                    "lat": 1.32498,  "lon": 103.81252},
+    {"id": 6289675, "name": "CGB",                         "lat": 1.28484,  "lon": 103.82913},
+    {"id": 3400991, "name": "Potong Pasir Singapore",      "lat": 1.33092,  "lon": 103.86867},
+    {"id": 6191434, "name": "Joo Chiat Place",             "lat": 1.31374,  "lon": 103.90176},
+    {"id": 3038744, "name": "Ocean Park",                  "lat": 1.30947,  "lon": 103.91785},
 ]
 
 AQ_EXCLUDE_PARAMS = {"temperature", "relativehumidity"}
