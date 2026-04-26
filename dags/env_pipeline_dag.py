@@ -1,7 +1,7 @@
 import json
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import psycopg2
 import psycopg2.extras
@@ -22,8 +22,9 @@ POSTGRES_DB = os.getenv("POSTGRES_DB", "envdata")
 POSTGRES_USER = os.getenv("POSTGRES_USER", "envuser")
 POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "envpass")
 
-START_DATE = "2026-01-19"
-END_DATE = "2026-01-21"
+_today = datetime.now(timezone.utc)
+END_DATE   = (_today - timedelta(days=7)).strftime("%Y-%m-%d")   # 7 hari lalu (batas aman Open-Meteo)
+START_DATE = (_today - timedelta(days=37)).strftime("%Y-%m-%d")  # 30 hari sebelum END_DATE
 
 LOCATIONS = [
     {"id": 6273498, "name": "461B AQ",                     "lat": 1.3555,   "lon": 103.74033},
