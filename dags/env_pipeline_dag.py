@@ -11,9 +11,7 @@ from airflow.operators.python import PythonOperator
 
 log = logging.getLogger(__name__)
 
-# =========================
 # CONFIG
-# =========================
 OPENAQ_API_KEY = os.getenv("OPENAQ_API_KEY")
 
 POSTGRES_HOST = os.getenv("POSTGRES_HOST", "postgres")
@@ -40,9 +38,6 @@ LOCATIONS = [
 AQ_EXCLUDE_PARAMS = {"temperature", "relativehumidity"}
 
 
-# =========================
-# HELPERS
-# =========================
 def get_db_connection():
     return psycopg2.connect(
         host=POSTGRES_HOST,
@@ -113,9 +108,6 @@ def paginate_sensor_measurements(sensor_id: int, date_from: str, date_to: str) -
     return all_results
 
 
-# =========================
-# MAIN ETL
-# =========================
 def run_env_pipeline():
     dag_run_id = f"manual_{datetime.now(timezone.utc).isoformat()}"
     run_ts = datetime.now(timezone.utc)
@@ -123,9 +115,7 @@ def run_env_pipeline():
     log.info("=== START PIPELINE ===")
     log.info("Range data: %s s.d. %s", START_DATE, END_DATE)
 
-    # -------------------------
     # 1. EXTRACT AIR QUALITY
-    # -------------------------
     aq_records_raw = []
 
     for loc in LOCATIONS:
@@ -204,9 +194,7 @@ def run_env_pipeline():
 
     log.info("[AQ] Total raw AQ records: %d", len(aq_records_raw))
 
-    # -------------------------
     # 2. EXTRACT WEATHER
-    # -------------------------
     weather_records_raw = []
 
     for loc in LOCATIONS:
@@ -250,9 +238,7 @@ def run_env_pipeline():
 
     log.info("[Weather] Total raw weather records: %d", len(weather_records_raw))
 
-    # -------------------------
     # 3. TRANSFORM
-    # -------------------------
     KNOWN_PARAMS = {"pm1", "pm25", "pm10", "um003"}
     AQ_VALID_RANGES = {
         "pm1": (0, 1000),
@@ -302,9 +288,7 @@ def run_env_pipeline():
     log.info("[Transform] AQ normalized: %d", len(aq_normalized))
     log.info("[Transform] Weather normalized: %d", len(weather_normalized))
 
-    # -------------------------
     # 4. LOAD
-    # -------------------------
     conn = get_db_connection()
 
     try:
@@ -475,9 +459,7 @@ def run_env_pipeline():
         conn.close()
 
 
-# =========================
 # DAG
-# =========================
 with DAG(
     dag_id="env_data_pipeline",
     start_date=datetime(2026, 1, 1),
