@@ -264,8 +264,7 @@ def load_data():
             relative_humidity_pct,
             apparent_temperature_c
         FROM env_merged
-        ORDER BY datetime_utc DESC
-        LIMIT 5000;
+        ORDER BY datetime_utc DESC;
     """
     df = pd.read_sql(query, conn)
     df["datetime_utc"] = pd.to_datetime(df["datetime_utc"])
