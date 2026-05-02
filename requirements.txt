@@ -4,3 +4,9 @@ requests
 streamlit
 pandas
 sqlalchemy
+plotly
+scipy
+statsmodels
+scikit-learn
+pydeck
+numpy

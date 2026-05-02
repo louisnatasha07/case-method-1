@@ -2,12 +2,12 @@ import json
 import logging
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import psycopg2
 import psycopg2.extras
 import requests
-from requests.exceptions import ChunkedEncodingError, ConnectionError, RequestException, Timeout
+from requests.exceptions import ChunkedEncodingError, ConnectionError, Timeout, RequestException
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 
@@ -24,21 +24,25 @@ POSTGRES_DB = os.getenv("POSTGRES_DB", "envdata")
 POSTGRES_USER = os.getenv("POSTGRES_USER", "envuser")
 POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "envpass")
 
-# Gunakan range yang sudah lewat, jangan future date.
-START_DATE = "2026-01-19"
-END_DATE = "2026-04-30"
+# Open-Meteo archive lebih aman pakai data yang sudah lewat.
+_today = datetime.now(timezone.utc)
+# Default final range for the project. Can be overridden from .env if needed.
+START_DATE = os.getenv("START_DATE", "2026-01-19")
+END_DATE = os.getenv("END_DATE", "2026-04-30")
 
-# 8 lokasi Singapore, CGB tidak dipakai karena baru mulai Maret 2026.
+# CGB di-drop karena datanya baru mulai sekitar Maret 2026.
 LOCATIONS = [
-    {"id": 3023432, "name": "NASA GSFC Rutgers Calib. N7", "lat": 1.2976, "lon": 103.7803},
-    {"id": 3038744, "name": "Ocean Park", "lat": 1.3094745, "lon": 103.9178515},
-    {"id": 3040714, "name": "Midwood", "lat": 1.3641, "lon": 103.7637},
-    {"id": 3400991, "name": "Potong Pasir Singapore", "lat": 1.330931, "lon": 103.868663},
-    {"id": 5905179, "name": "Shelford", "lat": 1.324983, "lon": 103.812506},
-    {"id": 6119237, "name": "Singapore", "lat": 1.3521, "lon": 103.8198},
-    {"id": 6191434, "name": "Joo Chiat Place", "lat": 1.313748, "lon": 103.90176},
-    {"id": 6273498, "name": "461B AQ", "lat": 1.3554983141500208, "lon": 103.74032475704472},
+    {"id": 6273498, "name": "461B AQ",                     "lat": 1.3554983141500208, "lon": 103.74032475704472},
+    {"id": 3040714, "name": "Midwood",                     "lat": 1.3641,              "lon": 103.7637},
+    {"id": 3023432, "name": "NASA GSFC Rutgers Calib. N7", "lat": 1.2976,              "lon": 103.7803},
+    {"id": 5905179, "name": "Shelford",                    "lat": 1.324983,            "lon": 103.812506},
+    {"id": 6119237, "name": "Singapore",                   "lat": 1.3521,              "lon": 103.8198},
+    {"id": 3400991, "name": "Potong Pasir Singapore",      "lat": 1.330931,            "lon": 103.868663},
+    {"id": 6191434, "name": "Joo Chiat Place",             "lat": 1.313748,            "lon": 103.90176},
+    {"id": 3038744, "name": "Ocean Park",                  "lat": 1.3094745,           "lon": 103.9178515},
 ]
+
+AQ_EXCLUDE_PARAMS = {"temperature", "relativehumidity"}
 
 # =========================
 # HELPERS
@@ -54,9 +58,6 @@ def get_db_connection():
 
 
 def openaq_get(path: str, params: dict | None = None, max_retries: int = 5) -> dict:
-    if not OPENAQ_API_KEY:
-        raise RuntimeError("OPENAQ_API_KEY belum diset di .env")
-
     headers = {
         "Accept": "application/json",
         "X-API-Key": OPENAQ_API_KEY,
@@ -65,20 +66,24 @@ def openaq_get(path: str, params: dict | None = None, max_retries: int = 5) -> d
 
     for attempt in range(1, max_retries + 1):
         try:
-            resp = requests.get(url, params=params, headers=headers, timeout=90)
+            resp = requests.get(url, params=params, headers=headers, timeout=60)
             if resp.status_code in (401, 403):
                 raise RuntimeError(f"OpenAQ API key tidak valid: {resp.text[:200]}")
             resp.raise_for_status()
             return resp.json()
-        except (ChunkedEncodingError, ConnectionError, Timeout, RequestException) as exc:
-            log.warning("[OpenAQ retry %d/%d] path=%s params=%s error=%s", attempt, max_retries, path, params, exc)
+        except (ChunkedEncodingError, ConnectionError, Timeout, RequestException) as e:
+            log.warning(
+                "[OpenAQ retry %d/%d] gagal request path=%s params=%s error=%s",
+                attempt, max_retries, path, params, str(e)
+            )
             if attempt == max_retries:
                 raise
             time.sleep(2 * attempt)
 
 
-def ts_to_datetime_utc(ts_raw: str) -> datetime:
-    return datetime.fromisoformat(ts_raw.replace("Z", "+00:00")).astimezone(timezone.utc)
+def ts_to_hour_key(ts_raw: str) -> str:
+    dt = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+    return dt.strftime("%Y-%m-%dT%H:00:00+00:00")
 
 
 def clean_value(v, lo, hi):
@@ -98,60 +103,25 @@ def paginate_sensor_measurements(sensor_id: int, date_from: str, date_to: str) -
     while True:
         raw = openaq_get(
             f"/sensors/{sensor_id}/measurements/hourly",
-            {"date_from": date_from, "date_to": date_to, "limit": 100, "page": page},
+            {
+                "date_from": date_from,
+                "date_to": date_to,
+                "limit": 100,
+                "page": page,
+            },
         )
         results = raw.get("results", [])
         if not results:
             break
 
         all_results.extend(results)
+
         if len(results) < 100:
             break
 
         page += 1
 
     return all_results
-
-
-def fetch_open_meteo(loc: dict) -> list[dict]:
-    resp = requests.get(
-        "https://archive-api.open-meteo.com/v1/archive",
-        params={
-            "latitude": loc["lat"],
-            "longitude": loc["lon"],
-            "hourly": "temperature_2m,relative_humidity_2m,apparent_temperature",
-            "temperature_unit": "celsius",
-            "timezone": "UTC",
-            "start_date": START_DATE,
-            "end_date": END_DATE,
-        },
-        timeout=90,
-    )
-    resp.raise_for_status()
-    hourly = resp.json().get("hourly", {})
-
-    rows = []
-    for i, ts in enumerate(hourly.get("time", [])):
-        dt = datetime.fromisoformat(ts).replace(tzinfo=timezone.utc)
-        rows.append({
-            "source": "Open-Meteo",
-            "location_id": loc["id"],
-            "location_name": loc["name"],
-            "latitude": loc["lat"],
-            "longitude": loc["lon"],
-            "temperature_c": hourly.get("temperature_2m", [None])[i] if i < len(hourly.get("temperature_2m", [])) else None,
-            "apparent_temperature_c": hourly.get("apparent_temperature", [None])[i] if i < len(hourly.get("apparent_temperature", [])) else None,
-            "relative_humidity_pct": hourly.get("relative_humidity_2m", [None])[i] if i < len(hourly.get("relative_humidity_2m", [])) else None,
-            "datetime_utc": dt,
-            "raw_payload": json.dumps({
-                "time": ts,
-                "temperature_2m": hourly.get("temperature_2m", [None])[i] if i < len(hourly.get("temperature_2m", [])) else None,
-                "apparent_temperature": hourly.get("apparent_temperature", [None])[i] if i < len(hourly.get("apparent_temperature", [])) else None,
-                "relative_humidity_2m": hourly.get("relative_humidity_2m", [None])[i] if i < len(hourly.get("relative_humidity_2m", [])) else None,
-            }),
-        })
-    return rows
-
 
 # =========================
 # MAIN ETL
@@ -160,18 +130,23 @@ def run_env_pipeline():
     dag_run_id = f"manual_{datetime.now(timezone.utc).isoformat()}"
     run_ts = datetime.now(timezone.utc)
 
-    log.info("=== START PIPELINE MEDALLION ===")
+    log.info("=== START MEDALLION PIPELINE ===")
     log.info("Range data: %s s.d. %s", START_DATE, END_DATE)
 
-    bronze_aq_rows = []
-    bronze_weather_rows = []
+    # -------------------------
+    # 1. EXTRACT AIR QUALITY
+    # -------------------------
+    aq_records_raw = []
 
-    # -------------------------
-    # 1. EXTRACT AQ -> BRONZE
-    # -------------------------
     for loc in LOCATIONS:
-        log.info("[AQ] Ambil sensors untuk %s (%s)", loc["name"], loc["id"])
-        sensor_data = openaq_get(f"/locations/{loc['id']}/sensors")
+        location_id = loc["id"]
+        location_name = loc["name"]
+        lat = loc["lat"]
+        lon = loc["lon"]
+
+        log.info("[AQ] Ambil sensors untuk %s (%s)", location_name, location_id)
+
+        sensor_data = openaq_get(f"/locations/{location_id}/sensors")
         sensors = [
             {
                 "sensor_id": s["id"],
@@ -182,188 +157,374 @@ def run_env_pipeline():
             if s.get("parameter", {}).get("name") == "pm25"
         ]
 
-        log.info("[AQ] %s punya %d sensor pm25", loc["name"], len(sensors))
+        log.info("[AQ] %s punya %d sensor pm25", location_name, len(sensors))
+        all_readings = {}
 
-        for sensor in sensors:
-            log.info("[AQ] Ambil measurements sensor_id=%s untuk %s", sensor["sensor_id"], loc["name"])
-            measurements = paginate_sensor_measurements(sensor["sensor_id"], START_DATE, END_DATE)
+        for s in sensors:
+            if s["param_name"] in AQ_EXCLUDE_PARAMS:
+                continue
+
+            log.info(
+                "[AQ] Ambil measurements sensor_id=%s param=%s untuk %s",
+                s["sensor_id"],
+                s["param_name"],
+                location_name,
+            )
+
+            measurements = paginate_sensor_measurements(
+                sensor_id=s["sensor_id"],
+                date_from=START_DATE,
+                date_to=END_DATE,
+            )
 
             for item in measurements:
                 period = item.get("period", {})
-                ts_raw = period.get("datetimeFrom", {}).get("utc") or item.get("datetime", {}).get("utc")
+                ts_raw = (
+                    period.get("datetimeFrom", {}).get("utc")
+                    or item.get("datetime", {}).get("utc")
+                )
                 if not ts_raw:
                     continue
 
+                hour_key = ts_to_hour_key(ts_raw)
                 value = item.get("value") or item.get("summary", {}).get("mean")
-                value = clean_value(value, 0, 1000)
-                if value is None:
-                    continue
 
-                bronze_aq_rows.append({
-                    "source": "OpenAQ",
-                    "location_id": loc["id"],
-                    "location_name": loc["name"],
-                    "latitude": loc["lat"],
-                    "longitude": loc["lon"],
-                    "parameter": sensor["param_name"],
-                    "value": round(float(value), 4),
-                    "unit": sensor["param_unit"],
-                    "datetime_utc": ts_to_datetime_utc(ts_raw),
-                    "raw_payload": json.dumps(item),
-                })
+                if value is not None:
+                    all_readings.setdefault(hour_key, {})[s["param_name"]] = {
+                        "value": round(float(value), 4),
+                        "unit": s["param_unit"],
+                    }
 
-    if not bronze_aq_rows:
-        raise RuntimeError("OpenAQ tidak mengembalikan data PM2.5 untuk semua lokasi.")
+        for hk in sorted(all_readings):
+            dt = datetime.fromisoformat(hk)
+            aq_records_raw.append({
+                "datetime_utc": hk,
+                "date": hk[:10],
+                "hour_utc": dt.hour,
+                "location_id": location_id,
+                "location_name": location_name,
+                "latitude": lat,
+                "longitude": lon,
+                "parameters": all_readings[hk],
+            })
 
-    log.info("[Bronze] AQ rows: %d", len(bronze_aq_rows))
+    if not aq_records_raw:
+        raise RuntimeError("OpenAQ tidak mengembalikan data apapun untuk semua lokasi.")
+
+    log.info("[AQ] Total raw AQ records: %d", len(aq_records_raw))
 
     # -------------------------
-    # 2. EXTRACT WEATHER -> BRONZE
+    # 2. EXTRACT WEATHER
     # -------------------------
+    weather_records_raw = []
+
     for loc in LOCATIONS:
-        log.info("[Weather] Ambil Open-Meteo untuk %s", loc["name"])
-        bronze_weather_rows.extend(fetch_open_meteo(loc))
+        location_id = loc["id"]
+        location_name = loc["name"]
+        lat = loc["lat"]
+        lon = loc["lon"]
 
-    log.info("[Bronze] Weather rows: %d", len(bronze_weather_rows))
+        log.info("[Weather] Ambil Open-Meteo untuk %s", location_name)
+
+        resp = requests.get(
+            "https://archive-api.open-meteo.com/v1/archive",
+            params={
+                "latitude": lat,
+                "longitude": lon,
+                "hourly": "temperature_2m,relative_humidity_2m,apparent_temperature",
+                "temperature_unit": "celsius",
+                "timezone": "UTC",
+                "start_date": START_DATE,
+                "end_date": END_DATE,
+            },
+            timeout=60,
+        )
+        resp.raise_for_status()
+        h = resp.json().get("hourly", {})
+
+        for i, ts in enumerate(h.get("time", [])):
+            dt = datetime.fromisoformat(ts).replace(tzinfo=timezone.utc)
+            hour_key = dt.strftime("%Y-%m-%dT%H:00:00+00:00")
+
+            weather_records_raw.append({
+                "datetime_utc": hour_key,
+                "date": dt.strftime("%Y-%m-%d"),
+                "hour_utc": dt.hour,
+                "location_id": location_id,
+                "location_name": location_name,
+                "latitude": lat,
+                "longitude": lon,
+                "temperature_c": h["temperature_2m"][i] if i < len(h.get("temperature_2m", [])) else None,
+                "apparent_temperature_c": h["apparent_temperature"][i] if i < len(h.get("apparent_temperature", [])) else None,
+                "relative_humidity_pct": h["relative_humidity_2m"][i] if i < len(h.get("relative_humidity_2m", [])) else None,
+            })
+
+    log.info("[Weather] Total raw weather records: %d", len(weather_records_raw))
 
     # -------------------------
-    # 3. LOAD BRONZE + TRANSFORM SILVER
+    # 3. TRANSFORM IN PYTHON
+    # -------------------------
+    KNOWN_PARAMS = {"pm1", "pm25", "pm10", "um003"}
+    AQ_VALID_RANGES = {
+        "pm1": (0, 1000),
+        "pm25": (0, 1000),
+        "pm10": (0, 2000),
+        "um003": (0, 100000),
+    }
+
+    aq_normalized = []
+    for row in aq_records_raw:
+        params = row.get("parameters", {})
+        extra = {}
+
+        flat = {
+            "datetime_utc": row["datetime_utc"],
+            "date": row["date"],
+            "hour_utc": row["hour_utc"],
+            "location_id": row["location_id"],
+            "location_name": row["location_name"],
+            "latitude": row["latitude"],
+            "longitude": row["longitude"],
+            "pm1": None,
+            "pm25": None,
+            "pm10": None,
+            "um003": None,
+        }
+
+        for pname, pdata in params.items():
+            val = pdata.get("value")
+            if pname in KNOWN_PARAMS:
+                lo, hi = AQ_VALID_RANGES[pname]
+                flat[pname] = clean_value(val, lo, hi)
+            else:
+                extra[pname] = pdata
+
+        flat["extra_params"] = extra if extra else None
+        aq_normalized.append(flat)
+
+    weather_normalized = []
+    for row in weather_records_raw:
+        weather_normalized.append({
+            **row,
+            "temperature_c": clean_value(row["temperature_c"], -10, 60),
+            "apparent_temperature_c": clean_value(row["apparent_temperature_c"], -20, 70),
+            "relative_humidity_pct": clean_value(row["relative_humidity_pct"], 0, 100),
+        })
+
+    log.info("[Transform] AQ normalized: %d", len(aq_normalized))
+    log.info("[Transform] Weather normalized: %d", len(weather_normalized))
+
+    # -------------------------
+    # 4. LOAD BRONZE + SILVER
     # -------------------------
     conn = get_db_connection()
 
     try:
+        dt_loc_to_meta = {}
+        for r in aq_normalized:
+            dt_loc_to_meta.setdefault((r["datetime_utc"], r["location_name"]), r)
+        for r in weather_normalized:
+            dt_loc_to_meta.setdefault((r["datetime_utc"], r["location_name"]), r)
+
+        slot_rows = [
+            {
+                "datetime_utc": dt,
+                "date": meta["date"],
+                "hour_utc": meta["hour_utc"],
+                "location_id": meta.get("location_id"),
+                "location_name": loc_name,
+                "latitude": meta["latitude"],
+                "longitude": meta["longitude"],
+            }
+            for (dt, loc_name), meta in dt_loc_to_meta.items()
+        ]
+
         with conn.cursor() as cur:
+            # BRONZE: slots
+            psycopg2.extras.execute_batch(
+                cur,
+                """
+                INSERT INTO bronze.measurement_slots
+                    (datetime_utc, date, hour_utc, location_id, location_name, latitude, longitude)
+                VALUES
+                    (%(datetime_utc)s, %(date)s, %(hour_utc)s, %(location_id)s,
+                     %(location_name)s, %(latitude)s, %(longitude)s)
+                ON CONFLICT (datetime_utc, location_name) DO UPDATE SET
+                    date        = EXCLUDED.date,
+                    hour_utc    = EXCLUDED.hour_utc,
+                    location_id = EXCLUDED.location_id,
+                    latitude    = EXCLUDED.latitude,
+                    longitude   = EXCLUDED.longitude
+                """,
+                slot_rows,
+                page_size=500,
+            )
+
+            cur.execute(
+                """
+                SELECT id, datetime_utc, location_name
+                FROM bronze.measurement_slots
+                WHERE date BETWEEN %s AND %s
+                """,
+                (START_DATE, END_DATE),
+            )
+            slot_id_map = {
+                (row[1].strftime("%Y-%m-%dT%H:00:00+00:00"), row[2]): row[0]
+                for row in cur.fetchall()
+            }
+
+        aq_rows = []
+        for r in aq_normalized:
+            sid = slot_id_map.get((r["datetime_utc"], r["location_name"]))
+            if sid is None:
+                continue
+            aq_rows.append({
+                "slot_id": sid,
+                "pm1": r.get("pm1"),
+                "pm25": r.get("pm25"),
+                "pm10": r.get("pm10"),
+                "um003": r.get("um003"),
+                "extra_params": json.dumps(r["extra_params"]) if r.get("extra_params") else None,
+            })
+
+        with conn.cursor() as cur:
+            # BRONZE: raw AQ
             psycopg2.extras.execute_batch(
                 cur,
                 """
                 INSERT INTO bronze.air_quality_raw
-                    (source, location_id, location_name, latitude, longitude, parameter,
-                     value, unit, datetime_utc, raw_payload)
+                    (slot_id, pm1, pm25, pm10, um003, extra_params)
                 VALUES
-                    (%(source)s, %(location_id)s, %(location_name)s, %(latitude)s, %(longitude)s,
-                     %(parameter)s, %(value)s, %(unit)s, %(datetime_utc)s, %(raw_payload)s)
-                ON CONFLICT (source, location_id, parameter, datetime_utc) DO UPDATE SET
-                    location_name = EXCLUDED.location_name,
-                    latitude = EXCLUDED.latitude,
-                    longitude = EXCLUDED.longitude,
-                    value = EXCLUDED.value,
-                    unit = EXCLUDED.unit,
-                    raw_payload = EXCLUDED.raw_payload,
-                    ingested_at = NOW()
+                    (%(slot_id)s, %(pm1)s, %(pm25)s, %(pm10)s, %(um003)s, %(extra_params)s)
+                ON CONFLICT (slot_id) DO UPDATE SET
+                    pm1          = EXCLUDED.pm1,
+                    pm25         = EXCLUDED.pm25,
+                    pm10         = EXCLUDED.pm10,
+                    um003        = EXCLUDED.um003,
+                    extra_params = EXCLUDED.extra_params,
+                    ingested_at  = NOW()
                 """,
-                bronze_aq_rows,
+                aq_rows,
                 page_size=500,
             )
 
+        weather_rows = []
+        for r in weather_normalized:
+            sid = slot_id_map.get((r["datetime_utc"], r["location_name"]))
+            if sid is None:
+                continue
+            weather_rows.append({
+                "slot_id": sid,
+                "temperature_c": r.get("temperature_c"),
+                "apparent_temperature_c": r.get("apparent_temperature_c"),
+                "relative_humidity_pct": r.get("relative_humidity_pct"),
+            })
+
+        with conn.cursor() as cur:
+            # BRONZE: raw weather
             psycopg2.extras.execute_batch(
                 cur,
                 """
                 INSERT INTO bronze.weather_raw
-                    (source, location_id, location_name, latitude, longitude,
-                     temperature_c, apparent_temperature_c, relative_humidity_pct,
-                     datetime_utc, raw_payload)
+                    (slot_id, temperature_c, apparent_temperature_c, relative_humidity_pct)
                 VALUES
-                    (%(source)s, %(location_id)s, %(location_name)s, %(latitude)s, %(longitude)s,
-                     %(temperature_c)s, %(apparent_temperature_c)s, %(relative_humidity_pct)s,
-                     %(datetime_utc)s, %(raw_payload)s)
-                ON CONFLICT (source, location_id, datetime_utc) DO UPDATE SET
-                    location_name = EXCLUDED.location_name,
-                    latitude = EXCLUDED.latitude,
-                    longitude = EXCLUDED.longitude,
-                    temperature_c = EXCLUDED.temperature_c,
+                    (%(slot_id)s, %(temperature_c)s, %(apparent_temperature_c)s, %(relative_humidity_pct)s)
+                ON CONFLICT (slot_id) DO UPDATE SET
+                    temperature_c          = EXCLUDED.temperature_c,
                     apparent_temperature_c = EXCLUDED.apparent_temperature_c,
-                    relative_humidity_pct = EXCLUDED.relative_humidity_pct,
-                    raw_payload = EXCLUDED.raw_payload,
-                    ingested_at = NOW()
+                    relative_humidity_pct  = EXCLUDED.relative_humidity_pct,
+                    ingested_at            = NOW()
                 """,
-                bronze_weather_rows,
+                weather_rows,
                 page_size=500,
             )
 
-            # Rebuild silver untuk range yang sedang diproses agar idempotent.
-            cur.execute("DELETE FROM silver.air_quality_clean WHERE date BETWEEN %s AND %s", (START_DATE, END_DATE))
-            cur.execute("DELETE FROM silver.weather_clean WHERE date BETWEEN %s AND %s", (START_DATE, END_DATE))
-
+            # SILVER: clean AQ
             cur.execute(
                 """
                 INSERT INTO silver.air_quality_clean
-                    (location_id, location_name, latitude, longitude, pm25, datetime_utc, date, hour_utc)
+                    (datetime_utc, date, hour_utc, location_id, location_name, latitude, longitude,
+                     pm1, pm25, pm10, um003, extra_params, processed_at)
                 SELECT
-                    location_id,
-                    location_name,
-                    latitude,
-                    longitude,
-                    AVG(value) AS pm25,
-                    date_trunc('hour', datetime_utc) AS datetime_utc,
-                    DATE(date_trunc('hour', datetime_utc)) AS date,
-                    EXTRACT(HOUR FROM date_trunc('hour', datetime_utc))::SMALLINT AS hour_utc
-                FROM bronze.air_quality_raw
-                WHERE parameter = 'pm25'
-                  AND DATE(datetime_utc) BETWEEN %s AND %s
-                GROUP BY location_id, location_name, latitude, longitude, date_trunc('hour', datetime_utc)
-                ON CONFLICT (location_id, datetime_utc) DO UPDATE SET
-                    location_name = EXCLUDED.location_name,
-                    latitude = EXCLUDED.latitude,
-                    longitude = EXCLUDED.longitude,
-                    pm25 = EXCLUDED.pm25,
-                    date = EXCLUDED.date,
-                    hour_utc = EXCLUDED.hour_utc,
+                    s.datetime_utc,
+                    s.date,
+                    s.hour_utc,
+                    s.location_id,
+                    s.location_name,
+                    s.latitude,
+                    s.longitude,
+                    aq.pm1,
+                    aq.pm25,
+                    aq.pm10,
+                    aq.um003,
+                    aq.extra_params,
+                    NOW()
+                FROM bronze.measurement_slots s
+                JOIN bronze.air_quality_raw aq ON aq.slot_id = s.id
+                WHERE s.date BETWEEN %s AND %s
+                ON CONFLICT (datetime_utc, location_name) DO UPDATE SET
+                    location_id  = EXCLUDED.location_id,
+                    latitude     = EXCLUDED.latitude,
+                    longitude    = EXCLUDED.longitude,
+                    pm1          = EXCLUDED.pm1,
+                    pm25         = EXCLUDED.pm25,
+                    pm10         = EXCLUDED.pm10,
+                    um003        = EXCLUDED.um003,
+                    extra_params = EXCLUDED.extra_params,
                     processed_at = NOW()
                 """,
                 (START_DATE, END_DATE),
             )
+            silver_aq_count = cur.rowcount
 
+            # SILVER: clean weather
             cur.execute(
                 """
                 INSERT INTO silver.weather_clean
-                    (location_id, location_name, latitude, longitude, temperature_c,
-                     apparent_temperature_c, relative_humidity_pct, datetime_utc, date, hour_utc)
+                    (datetime_utc, date, hour_utc, location_id, location_name, latitude, longitude,
+                     temperature_c, apparent_temperature_c, relative_humidity_pct, processed_at)
                 SELECT
-                    location_id,
-                    location_name,
-                    latitude,
-                    longitude,
-                    AVG(temperature_c) AS temperature_c,
-                    AVG(apparent_temperature_c) AS apparent_temperature_c,
-                    AVG(relative_humidity_pct) AS relative_humidity_pct,
-                    date_trunc('hour', datetime_utc) AS datetime_utc,
-                    DATE(date_trunc('hour', datetime_utc)) AS date,
-                    EXTRACT(HOUR FROM date_trunc('hour', datetime_utc))::SMALLINT AS hour_utc
-                FROM bronze.weather_raw
-                WHERE DATE(datetime_utc) BETWEEN %s AND %s
-                GROUP BY location_id, location_name, latitude, longitude, date_trunc('hour', datetime_utc)
-                ON CONFLICT (location_id, datetime_utc) DO UPDATE SET
-                    location_name = EXCLUDED.location_name,
-                    latitude = EXCLUDED.latitude,
-                    longitude = EXCLUDED.longitude,
-                    temperature_c = EXCLUDED.temperature_c,
-                    apparent_temperature_c = EXCLUDED.apparent_temperature_c,
-                    relative_humidity_pct = EXCLUDED.relative_humidity_pct,
-                    date = EXCLUDED.date,
-                    hour_utc = EXCLUDED.hour_utc,
-                    processed_at = NOW()
+                    s.datetime_utc,
+                    s.date,
+                    s.hour_utc,
+                    s.location_id,
+                    s.location_name,
+                    s.latitude,
+                    s.longitude,
+                    w.temperature_c,
+                    w.apparent_temperature_c,
+                    w.relative_humidity_pct,
+                    NOW()
+                FROM bronze.measurement_slots s
+                JOIN bronze.weather_raw w ON w.slot_id = s.id
+                WHERE s.date BETWEEN %s AND %s
+                ON CONFLICT (datetime_utc, location_name) DO UPDATE SET
+                    location_id             = EXCLUDED.location_id,
+                    latitude                = EXCLUDED.latitude,
+                    longitude               = EXCLUDED.longitude,
+                    temperature_c           = EXCLUDED.temperature_c,
+                    apparent_temperature_c  = EXCLUDED.apparent_temperature_c,
+                    relative_humidity_pct   = EXCLUDED.relative_humidity_pct,
+                    processed_at            = NOW()
                 """,
                 (START_DATE, END_DATE),
             )
-
-            cur.execute("SELECT COUNT(*) FROM silver.air_quality_clean WHERE date BETWEEN %s AND %s", (START_DATE, END_DATE))
-            silver_aq_count = cur.fetchone()[0]
-            cur.execute("SELECT COUNT(*) FROM silver.weather_clean WHERE date BETWEEN %s AND %s", (START_DATE, END_DATE))
-            silver_weather_count = cur.fetchone()[0]
+            silver_weather_count = cur.rowcount
 
             cur.execute(
                 """
-                INSERT INTO metadata.pipeline_runs
-                    (dag_run_id, date_from, date_to, bronze_aq_records, bronze_weather_records,
+                INSERT INTO pipeline_runs
+                    (dag_run_id, date_from, date_to, slot_records, aq_records, temp_records,
                      silver_aq_records, silver_weather_records, status, finished_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, 'success', %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'success', %s)
                 """,
                 (
                     dag_run_id,
                     START_DATE,
                     END_DATE,
-                    len(bronze_aq_rows),
-                    len(bronze_weather_rows),
+                    len(slot_rows),
+                    len(aq_rows),
+                    len(weather_rows),
                     silver_aq_count,
                     silver_weather_count,
                     run_ts,
@@ -372,8 +533,14 @@ def run_env_pipeline():
 
         conn.commit()
         log.info(
-            "[Load] selesai | bronze_aq=%d | bronze_weather=%d | silver_aq=%d | silver_weather=%d",
-            len(bronze_aq_rows), len(bronze_weather_rows), silver_aq_count, silver_weather_count
+            "[Load] selesai | range=%s s.d. %s | slots=%d | bronze_aq=%d | bronze_weather=%d | silver_aq=%d | silver_weather=%d",
+            START_DATE,
+            END_DATE,
+            len(slot_rows),
+            len(aq_rows),
+            len(weather_rows),
+            silver_aq_count,
+            silver_weather_count,
         )
 
     except Exception as exc:
@@ -382,7 +549,7 @@ def run_env_pipeline():
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    INSERT INTO metadata.pipeline_runs
+                    INSERT INTO pipeline_runs
                         (dag_run_id, date_from, date_to, status, error_message, finished_at)
                     VALUES (%s, %s, %s, 'failed', %s, %s)
                     """,
@@ -394,7 +561,6 @@ def run_env_pipeline():
         raise
     finally:
         conn.close()
-
 
 # =========================
 # DAG
