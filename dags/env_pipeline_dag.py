@@ -568,7 +568,7 @@ def run_env_pipeline():
 with DAG(
     dag_id="env_data_pipeline",
     start_date=datetime(2026, 1, 1),
-    schedule=None,
+    schedule="0 19 * * *",  # jam 19:00 UTC = 02:00 WIB,
     catchup=False,
     tags=["env", "singapore", "medallion"],
 ) as dag:
