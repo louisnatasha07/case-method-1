@@ -565,11 +565,22 @@ def run_env_pipeline():
 # =========================
 # DAG
 # =========================
+from datetime import timedelta
+
+default_args = {
+    "owner": "airflow",
+    "retries": 5,
+    "retry_delay": timedelta(minutes=5),
+    "retry_exponential_backoff": True,
+    "max_retry_delay": timedelta(minutes=30),
+}
+
 with DAG(
     dag_id="env_data_pipeline",
     start_date=datetime(2026, 1, 1),
-    schedule="0 19 * * *",  # jam 19:00 UTC = 02:00 WIB,
+    schedule="0 19 * * *",
     catchup=False,
+    default_args=default_args, 
     tags=["env", "singapore", "medallion"],
 ) as dag:
     run_pipeline = PythonOperator(
